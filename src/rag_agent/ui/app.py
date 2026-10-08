@@ -22,8 +22,10 @@ PEP 8 | OOP | Single Responsibility
 from __future__ import annotations
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import streamlit as st
+from langchain_core.messages import HumanMessage
 
 from rag_agent.agent.graph import get_compiled_graph
 from rag_agent.agent.state import AgentResponse
@@ -116,28 +118,64 @@ def render_ingestion_panel(
     """
     st.sidebar.header("📂 Corpus Ingestion")
 
-    # TODO: implement
-    # 1. st.sidebar.file_uploader(
-    #        "Upload study materials",
-    #        type=["pdf", "md"],
-    #        accept_multiple_files=True
-    #    )
-    #
-    # 2. "Ingest Documents" button — only enabled when files are selected
-    #
-    # 3. On button click:
-    #    a. Save uploaded files to a temp directory
-    #    b. chunker.chunk_files(file_paths)
-    #    c. store.ingest(chunks) → IngestionResult
-    #    d. Display result: st.success / st.warning / st.error
-    #       Show: "{result.ingested} chunks added, {result.skipped} duplicates skipped"
-    #    e. Refresh ingested documents list in session_state
-    #
-    # 4. Render ingested documents list below the uploader
-    #    For each document: show source name, topic, chunk count
-    #    Add a small "🗑 Remove" button per document that calls store.delete_document()
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload study materials",
+        type=["pdf", "md"],
+        accept_multiple_files=True,
+    )
+    if st.sidebar.button("Ingest Documents", disabled=not uploaded_files):
+        try:
+            with TemporaryDirectory() as temp_dir:
+                file_paths = []
+                for index, uploaded_file in enumerate(uploaded_files):
+                    upload_dir = Path(temp_dir) / str(index)
+                    upload_dir.mkdir()
+                    file_path = upload_dir / Path(uploaded_file.name).name
+                    file_path.write_bytes(uploaded_file.getvalue())
+                    file_paths.append(file_path)
+                chunks = chunker.chunk_files(file_paths)
+                result = store.ingest(chunks)
+            st.session_state["last_ingestion_result"] = result
+            summary = (
+                f"{result.ingested} chunks added, "
+                f"{result.skipped} duplicates skipped"
+            )
+            if result.ingested:
+                st.sidebar.success(summary)
+            else:
+                st.sidebar.warning(summary)
+            if not chunks:
+                st.sidebar.warning("No readable chunks found in the uploaded files.")
+            for error in result.errors:
+                st.sidebar.error(error)
+        except Exception as exc:
+            st.sidebar.error(f"Document ingestion failed: {exc}")
 
-    st.sidebar.info("Upload .pdf or .md files to populate the corpus.")
+    try:
+        documents = store.list_documents()
+        st.session_state["ingested_documents"] = documents
+    except Exception as exc:
+        st.sidebar.error(f"Could not load documents: {exc}")
+        return
+
+    if not documents:
+        st.sidebar.info("Upload .pdf or .md files to populate the corpus.")
+    for document in documents:
+        source = document["source"]
+        st.sidebar.write(
+            f"{source} | {document['topic']} | "
+            f"{document['chunk_count']} chunks"
+        )
+        if st.sidebar.button("🗑 Remove", key=f"remove_document_{source}"):
+            try:
+                store.delete_document(source)
+                st.session_state["ingested_documents"] = store.list_documents()
+                if st.session_state.get("selected_document") == source:
+                    st.session_state["selected_document"] = None
+            except Exception as exc:
+                st.sidebar.error(f"Could not remove {source}: {exc}")
+            else:
+                st.rerun()
 
 
 def render_corpus_stats(store: VectorStoreManager) -> None:
@@ -151,15 +189,18 @@ def render_corpus_stats(store: VectorStoreManager) -> None:
     ----------
     store : VectorStoreManager
     """
-    # TODO: implement
-    # stats = store.get_collection_stats()
-    # st.sidebar.metric("Total Chunks", stats["total_chunks"])
-    # st.sidebar.write("Topics:", ", ".join(stats["topics"]))
-    # if stats["bonus_topics_present"]:
-    #     st.sidebar.success("✅ Bonus topics present")
-    # else:
-    #     st.sidebar.warning("⚠️ No bonus topics yet")
-    pass
+    try:
+        stats = store.get_collection_stats()
+    except Exception as exc:
+        st.sidebar.error(f"Could not load corpus statistics: {exc}")
+        return
+
+    st.sidebar.metric("Total Chunks", stats["total_chunks"])
+    st.sidebar.write("Topics:", ", ".join(stats["topics"]))
+    if stats["bonus_topics_present"]:
+        st.sidebar.success("✅ Bonus topics present")
+    else:
+        st.sidebar.warning("⚠️ No bonus topics yet")
 
 
 # ---------------------------------------------------------------------------
@@ -180,23 +221,59 @@ def render_document_viewer(store: VectorStoreManager) -> None:
     """
     st.subheader("📄 Document Viewer")
 
-    # TODO: implement
-    # 1. If no documents ingested: show placeholder message
-    #
-    # 2. st.selectbox("Select document", options=[doc["source"] for doc in docs])
-    #    Store selection in st.session_state["selected_document"]
-    #
-    # 3. On selection change: store.get_document_chunks(selected_source)
-    #
-    # 4. Render chunks in a scrollable container (st.container with fixed height)
-    #    For each chunk:
-    #    - Show metadata badge: topic | difficulty | type
-    #    - Show chunk text
-    #    - Show similarity score if this chunk was used in last response
-    #
-    # 5. Display chunk count and coverage summary below viewer
+    documents = st.session_state.get("ingested_documents", [])
+    if not documents:
+        st.session_state["selected_document"] = None
+        st.info("Ingest documents using the sidebar to view content here.")
+        return
 
-    st.info("Ingest documents using the sidebar to view content here.")
+    sources = [document["source"] for document in documents]
+    if st.session_state.get("selected_document") not in sources:
+        st.session_state["selected_document"] = sources[0]
+    selected_source = st.selectbox(
+        "Select document", options=sources, key="selected_document"
+    )
+    try:
+        chunks = store.get_document_chunks(selected_source)
+    except Exception as exc:
+        st.error(f"Could not load {selected_source}: {exc}")
+        return
+
+    last_response = next(
+        (
+            message
+            for message in reversed(st.session_state.get("chat_history", []))
+            if message["role"] == "assistant"
+        ),
+        {},
+    )
+    scores = {
+        chunk.chunk_id: chunk.score
+        for chunk in last_response.get("retrieved_chunks", [])
+    }
+    with st.container(height=400):
+        if not chunks:
+            st.info("No chunks found for this document.")
+        for chunk in chunks:
+            metadata = chunk.metadata
+            st.caption(
+                f"{metadata.topic} | {metadata.difficulty} | {metadata.type}"
+            )
+            st.markdown(chunk.chunk_text)
+            if chunk.chunk_id in scores:
+                st.caption(f"Similarity: {scores[chunk.chunk_id]:.2f}")
+            st.divider()
+
+    st.caption(f"{len(chunks)} chunks")
+    if chunks:
+        topics = sorted({chunk.metadata.topic for chunk in chunks})
+        difficulties = sorted({chunk.metadata.difficulty for chunk in chunks})
+        types = sorted({chunk.metadata.type for chunk in chunks})
+        st.caption(
+            f"Topics: {', '.join(topics)} | "
+            f"Difficulties: {', '.join(difficulties)} | "
+            f"Types: {', '.join(types)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -223,11 +300,24 @@ def render_chat_interface(graph) -> None:
     # Filters
     col_topic, col_diff = st.columns(2)
     with col_topic:
-        # TODO: st.selectbox for topic filter
-        pass
+        st.selectbox(
+            "Topic",
+            options=[
+                None, "ANN", "CNN", "RNN", "LSTM", "Seq2Seq",
+                "Autoencoder", "SOM", "BoltzmannMachine", "GAN",
+            ],
+            format_func=lambda topic: "All topics" if topic is None else topic,
+            key="topic_filter",
+        )
     with col_diff:
-        # TODO: st.selectbox for difficulty filter
-        pass
+        st.selectbox(
+            "Difficulty",
+            options=[None, "beginner", "intermediate", "advanced"],
+            format_func=lambda difficulty: (
+                "All difficulties" if difficulty is None else difficulty.capitalize()
+            ),
+            key="difficulty_filter",
+        )
 
     # Chat history display
     chat_container = st.container(height=400)
@@ -243,22 +333,42 @@ def render_chat_interface(graph) -> None:
                     st.warning("⚠️ No relevant content found in corpus.")
 
     # Chat input
-    # TODO: implement
-    # 1. query = st.chat_input("Ask about a deep learning topic...")
-    #
-    # 2. On submit:
-    #    a. Append user message to chat_history
-    #    b. Display user message immediately (st.rerun or direct render)
-    #    c. Build LangGraph input:
-    #       {"messages": [HumanMessage(content=query)]}
-    #    d. config = {"configurable": {"thread_id": st.session_state.thread_id}}
-    #    e. result = graph.invoke(input, config=config)
-    #    f. response = result["final_response"]
-    #    g. Append assistant message with answer, sources, no_context_found flag
-    #
-    # STRETCH GOAL — streaming:
-    # Replace graph.invoke with graph.stream() and use st.write_stream()
-    # to display tokens as they arrive. Significant "wow factor" in Hour 3.
+    query = st.chat_input("Ask about a deep learning topic...")
+    if query:
+        st.session_state.chat_history.append({"role": "user", "content": query})
+        with chat_container:
+            with st.chat_message("user"):
+                st.markdown(query)
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    result = graph.invoke(
+                        {
+                            "messages": [HumanMessage(content=query)],
+                            "topic_filter": st.session_state.topic_filter,
+                            "difficulty_filter": st.session_state.difficulty_filter,
+                        },
+                        config={
+                            "configurable": {
+                                "thread_id": st.session_state.thread_id,
+                            }
+                        },
+                    )
+                response: AgentResponse = result["final_response"]
+                st.session_state.chat_history.append(
+                    {
+                        "role": "assistant",
+                        "content": response.answer,
+                        "sources": response.sources,
+                        "no_context_found": response.no_context_found,
+                    }
+                )
+                st.markdown(response.answer)
+                if response.sources:
+                    with st.expander("📎 Sources"):
+                        for source in response.sources:
+                            st.caption(source)
+                if response.no_context_found:
+                    st.warning("⚠️ No relevant content found in corpus.")
 
 
 # ---------------------------------------------------------------------------
